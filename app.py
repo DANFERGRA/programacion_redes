@@ -1,5 +1,8 @@
 import socket
-print("HELLO WORLD")
+print("DANFERGRA")
 
 hostname= socket.gethostname()
 print(f"Hostname:{hostname}")
+
+ipaddress=socket.gethostbyname(hostname)
+print(f"ip addres: {ipaddress}")
