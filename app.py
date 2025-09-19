@@ -8,4 +8,5 @@ ipaddress=socket.gethostbyname(hostname)
 print(f"ip addres: {ipaddress}")
 
 while True:
-    print("Hola"
+    print("Hola")
+    break
