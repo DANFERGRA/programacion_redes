@@ -19,4 +19,4 @@ n1=int(input("dame 1 numero: "))
 n2=int(input("Dame otro num: "))
 print(n1+n2)
 
-print("resta" n1-n2)
+print("resta", n1-n2)
