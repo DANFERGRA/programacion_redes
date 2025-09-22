@@ -10,3 +10,11 @@ print(f"ip addres: {ipaddress}")
 while True:
     print("Hola")
     break
+
+#git checkout -b feature/multiplicacion ||| te menea la rama para que no le pase nada 
+#si me quere ver la rama el comando es | git branch la del asterisco es la mera wena
+#
+
+n1=int(input("dame 1 numero: "))
+n2=int(input("Dame otro num: "))
+print(n1+n2)
