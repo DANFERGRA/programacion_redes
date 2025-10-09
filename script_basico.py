@@ -1,29 +1,77 @@
-# mi_practica_router.py
+# script.py
 # Autor: tú 😎
-# Objetivo: Menú para (1) consola interactiva en vivo y (2) configurar equipos Cisco en lote
-#           leyendo Data.csv o inventario.xlsx en la misma carpeta.
-# Nota: Requiere: pip install pyserial pandas openpyxl
+# Objetivo:
+# - Consola en vivo para controlar routers/switches Cisco por consola serial.
+# - Capturar y parsear estado de interfaces con TextFSM.
+# - Guardar snapshots y detectar cambios reales en CSVs.
+#
+# Requisitos:
+#   pip install pyserial textfsm
+#
+# Uso:
+#   python script.py
+#
+# Notas:
+# - Hotkey para salir de la consola: Ctrl + ]
+# - Si hay varios puertos, te pedirá cuál usar.
+# - CSVs generados:
+#   * interfaces_snapshot_<YYYYmmdd_HHMMSS>.csv  (snapshot completo)
+#   * interfaces_state.csv  (último estado por interfaz)
+#   * interfaces_changes.csv (solo cambios, con before/after y timestamp)
+# - Logs crudos en ./logs/
 
 import os
 import re
 import sys
 import time
+import csv
 import threading
-from typing import Optional, List, Dict
-
-import pandas as pd
+from datetime import datetime
+from typing import Optional, List, Dict, Tuple
 
 # -------------------- Ajustes --------------------
-ARCHIVOS_BUSCADOS = ["Data.csv", "inventario.xlsx"]   # se intentan en ese orden
 VELOCIDAD_DEF = 9600
-TIMEOUT_S = 0.0  # 0.0 = non-blocking para la consola en vivo
+TIMEOUT_S = 0.0  # non-blocking lectura
+LOGS_DIR = "logs"
+STATE_FILE = "interfaces_state.csv"
+CHANGES_FILE = "interfaces_changes.csv"
 
-# Regex de lectura del serial en Cisco
-RE_SERIE = re.compile(r"(?:Processor board ID\s+(\S+))|(?:SN:\s*([A-Za-z0-9\-]+))|(?:Serial Number:\s*([A-Za-z0-9\-]+))",
-                      re.IGNORECASE)
-
-# Validación “sana” para serie (opcional)
+# -------------------- Regex útiles --------------------
+RE_PROMPT_HOST = re.compile(r"^\s*([A-Za-z0-9._\-]+)\s*[>#]\s*$", re.M)
+RE_SERIE = re.compile(
+    r"(?:Processor board ID\s+(\S+))|(?:SN:\s*([A-Za-z0-9\-]+))|(?:Serial Number:\s*([A-Za-z0-9\-]+))",
+    re.IGNORECASE
+)
 RE_SERIE_VALIDA = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{4,24}$")
+
+# -------------------- TextFSM Templates (embebidas) --------------------
+TEMPLATE_SHOW_IP_INT_BRIEF = r"""
+Value Required INTERFACE (\S+)
+Value IP_ADDRESS (\S+)
+Value OK (\S+)
+Value METHOD (\S+)
+Value STATUS (administratively down|up|down|reset|deleted|unknown|\S+(?:\s\S+)*)
+Value PROTOCOL (up|down|administratively down|unset|\S+)
+
+Start
+  ^${INTERFACE}\s+${IP_ADDRESS}\s+${OK}\s+${METHOD}\s+${STATUS}\s+${PROTOCOL}\s*$ -> Record
+"""
+
+TEMPLATE_SHOW_INTERFACES_STATUS = r"""
+Value Required PORT (\S+)
+Value NAME (.*?)
+Value STATUS (connected|notconnect|disabled|err\-disabled|suspended|inactive|monitoring|^S.*|^R.*|^[A-Za-z]+)
+Value VLAN (\S+)
+Value DUPLEX (\S+)
+Value SPEED (\S+)
+Value TYPE (.+)
+
+Start
+  ^Port\s+Name\s+Status\s+Vlan\s+Duplex\s+Speed\s+Type -> Continue
+  ^-{3,}.* -> Continue
+  ^${PORT}\s+${NAME}\s+${STATUS}\s+${VLAN}\s+${DUPLEX}\s+${SPEED}\s+${TYPE}\s*$ -> Record
+  ^${PORT}\s+${STATUS}\s+${VLAN}\s+${DUPLEX}\s+${SPEED}\s+${TYPE}\s*$ -> Record
+"""
 
 # -------------------- Serial --------------------
 try:
@@ -41,7 +89,6 @@ def puertos_disponibles() -> List[str]:
 def abrir_puerto(com: str, baud: int = VELOCIDAD_DEF, timeout: float = 1.0):
     if serial is None:
         raise RuntimeError("pyserial no está instalado. Instala con: pip install pyserial")
-    # Desactiva RTS/CTS y DSR/DTR para la mayoría de cables USB-serial consola Cisco
     return serial.Serial(
         port=com,
         baudrate=baud,
@@ -51,14 +98,14 @@ def abrir_puerto(com: str, baud: int = VELOCIDAD_DEF, timeout: float = 1.0):
         dsrdtr=False
     )
 
-def txrx(ser, cmd: str, espera: float = 0.6, repeticiones: int = 6) -> str:
-    """Envía cmd + CRLF y hace lecturas pequeñas para evitar bloqueos."""
+def txrx(ser, cmd: str, espera: float = 0.5, repeticiones: int = 8) -> str:
+    """Envía cmd + CRLF y lee en ráfagas cortas para no bloquear."""
     try:
         _ = ser.read(ser.in_waiting or 0)  # limpia buffer
     except Exception:
         pass
     ser.write((cmd + "\r\n").encode(errors="ignore"))
-    salida = ""
+    out = ""
     for _ in range(repeticiones):
         time.sleep(espera)
         try:
@@ -66,14 +113,31 @@ def txrx(ser, cmd: str, espera: float = 0.6, repeticiones: int = 6) -> str:
         except Exception:
             chunk = ""
         if chunk:
-            salida += chunk
-    return salida
+            out += chunk
+    return out
 
 def despertar(ser) -> None:
-    # varios ENTER para sacar prompt y activar terminal length 0
     for _ in range(3):
-        txrx(ser, "", 0.2, 2)
-    txrx(ser, "terminal length 0", 0.3, 3)
+        txrx(ser, "", 0.15, 2)
+    txrx(ser, "terminal length 0", 0.2, 3)
+
+# -------------------- Helpers --------------------
+def now_tag() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def asegurar_logs():
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
+def guardar_log(nombre_base: str, contenido: str) -> str:
+    asegurar_logs()
+    ruta = os.path.join(LOGS_DIR, f"{nombre_base}_{now_tag()}.log")
+    with open(ruta, "w", encoding="utf-8", errors="ignore") as f:
+        f.write(contenido or "")
+    return ruta
+
+def extraer_hostname(texto: str) -> Optional[str]:
+    m = RE_PROMPT_HOST.search(texto or "")
+    return m.group(1) if m else None
 
 def extraer_serie(texto: str) -> Optional[str]:
     m = RE_SERIE.search(texto or "")
@@ -81,72 +145,202 @@ def extraer_serie(texto: str) -> Optional[str]:
         return None
     for g in m.groups():
         if g:
-            return g.strip()
+            s = g.strip()
+            if RE_SERIE_VALIDA.match(s):
+                return s
+            return s
     return None
 
-def leer_serie_equipo(ser) -> Optional[str]:
+# -------------------- TextFSM parsing --------------------
+def parse_textfsm(template_str: str, text: str) -> List[Dict[str, str]]:
+    try:
+        import textfsm
+    except Exception:
+        print("[-] Falta textfsm. Instala: pip install textfsm")
+        return []
+    from io import StringIO
+    fsm = textfsm.TextFSM(StringIO(template_str))
+    headers = list(fsm.header) if getattr(fsm, "header", None) else []
+    rows = fsm.ParseText(text or "")
+    parsed = []
+    for r in rows:
+        d = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
+        parsed.append(d)
+    return parsed
+
+# -------------------- CSV state management --------------------
+def leer_estado_actual() -> Dict[Tuple[str, str], Tuple[str, str, str]]:
+    """
+    Regresa dict: (hostname, interface) -> (ip, status, protocol)
+    """
+    estado = {}
+    if not os.path.exists(STATE_FILE):
+        return estado
+    with open(STATE_FILE, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            k = (row.get("HOSTNAME",""), row.get("INTERFACE",""))
+            estado[k] = (row.get("IP_ADDRESS",""), row.get("STATUS",""), row.get("PROTOCOL",""))
+    return estado
+
+def escribir_estado_actual(rows: List[Dict[str, str]]):
+    fields = ["HOSTNAME","INTERFACE","IP_ADDRESS","STATUS","PROTOCOL","SOURCE_CMD","SNAPSHOT_TS"]
+    with open(STATE_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k,"") for k in fields})
+
+def append_cambios(cambios: List[Dict[str, str]]):
+    existe = os.path.exists(CHANGES_FILE)
+    fields = ["TS","HOSTNAME","INTERFACE",
+              "OLD_IP","OLD_STATUS","OLD_PROTOCOL",
+              "NEW_IP","NEW_STATUS","NEW_PROTOCOL",
+              "SOURCE_CMD"]
+    with open(CHANGES_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        if not existe:
+            w.writeheader()
+        for c in cambios:
+            w.writerow(c)
+
+def escribir_snapshot(nombre: str, rows: List[Dict[str, str]]):
+    if not rows:
+        return
+    fields = ["HOSTNAME","INTERFACE","IP_ADDRESS","STATUS","PROTOCOL","SOURCE_CMD","SNAPSHOT_TS"]
+    with open(nombre, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k,"") for k in fields})
+
+# -------------------- Captura de interfaces --------------------
+def capturar_interfaces(ser) -> Tuple[str, List[Dict[str, str]]]:
+    """
+    Devuelve (hostname, filas_unificadas)
+    Filas contienen: HOSTNAME, INTERFACE/IP/STATUS/PROTOCOL, SOURCE_CMD, SNAPSHOT_TS
+    """
     despertar(ser)
-    out = txrx(ser, "show inventory", 0.7, 10)
-    if len(out.strip()) < 10:
-        out += "\n" + txrx(ser, "show version", 0.7, 10)
-    serie = extraer_serie(out)
-    if serie and RE_SERIE_VALIDA.match(serie):
-        return serie
-    return serie
 
-# -------------------- Inventario --------------------
-def buscar_archivo_inventario() -> Optional[str]:
-    for nombre in ARCHIVOS_BUSCADOS:
-        p = os.path.join(os.getcwd(), nombre)
-        if os.path.exists(p):
-            return p
-    return None
+    # Obtén prompt para hostname
+    prompt_raw = txrx(ser, "", 0.2, 2)
+    host = extraer_hostname(prompt_raw) or "UNKNOWN"
+    # Intenta hostname del running-config si no hubo prompt claro
+    if host == "UNKNOWN":
+        rc = txrx(ser, "show running-config | include ^hostname", 0.3, 6)
+        m = re.search(r"^hostname\s+(\S+)", rc, re.M)
+        if m:
+            host = m.group(1)
 
-def cargar_inventario(path: str) -> pd.DataFrame:
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".csv":
-        df = pd.read_csv(path)
-    elif ext in [".xlsx", ".xls"]:
-        df = pd.read_excel(path, sheet_name=0, engine="openpyxl")
+    snapshot_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # --- show ip interface brief ---
+    raw_ip = txrx(ser, "show ip interface brief", 0.35, 12)
+    guardar_log(f"{host}_show_ip_interface_brief", raw_ip)
+    p1 = parse_textfsm(TEMPLATE_SHOW_IP_INT_BRIEF, raw_ip)
+    rows1 = []
+    for d in p1:
+        rows1.append({
+            "HOSTNAME": host,
+            "INTERFACE": d.get("INTERFACE",""),
+            "IP_ADDRESS": d.get("IP_ADDRESS","unassigned"),
+            "STATUS": d.get("STATUS",""),
+            "PROTOCOL": d.get("PROTOCOL",""),
+            "SOURCE_CMD": "show ip interface brief",
+            "SNAPSHOT_TS": snapshot_ts
+        })
+
+    # --- show interfaces status (si existe) ---
+    raw_st = txrx(ser, "show interfaces status", 0.35, 12)
+    if raw_st and len(raw_st.strip()) > 0 and "Invalid input" not in raw_st:
+        guardar_log(f"{host}_show_interfaces_status", raw_st)
+        p2 = parse_textfsm(TEMPLATE_SHOW_INTERFACES_STATUS, raw_st)
+        # Lo mapeamos para que INTERFACE coincida con PORT y protocol sin campo (lo dejamos vacío)
+        for d in p2:
+            rows1.append({
+                "HOSTNAME": host,
+                "INTERFACE": d.get("PORT",""),
+                "IP_ADDRESS": "",  # no viene en este comando
+                "STATUS": d.get("STATUS",""),
+                "PROTOCOL": "",    # no aplica aquí
+                "SOURCE_CMD": "show interfaces status",
+                "SNAPSHOT_TS": snapshot_ts
+            })
+
+    # Si no hubo parseo, preserva crudo en una fila
+    if not rows1:
+        rows1.append({
+            "HOSTNAME": host, "INTERFACE": "", "IP_ADDRESS": "", "STATUS": "",
+            "PROTOCOL": "", "SOURCE_CMD": "raw", "SNAPSHOT_TS": snapshot_ts
+        })
+
+    return host, rows1
+
+def detectar_y_guardar_cambios(rows: List[Dict[str, str]]):
+    """
+    Compara contra interfaces_state.csv; agrega cambios a interfaces_changes.csv
+    y refresca interfaces_state.csv con última foto.
+    """
+    estado_prev = leer_estado_actual()
+    cambios: List[Dict[str,str]] = []
+    # Construye estado nuevo por última snapshot (preferimos entrada por entrada, último valor gana)
+    estado_nuevo: Dict[Tuple[str,str], Dict[str,str]] = {}
+
+    for r in rows:
+        k = (r.get("HOSTNAME",""), r.get("INTERFACE",""))
+        if not k[1]:
+            continue
+        estado_nuevo[k] = {
+            "HOSTNAME": k[0],
+            "INTERFACE": k[1],
+            "IP_ADDRESS": r.get("IP_ADDRESS",""),
+            "STATUS": r.get("STATUS",""),
+            "PROTOCOL": r.get("PROTOCOL",""),
+            "SOURCE_CMD": r.get("SOURCE_CMD",""),
+            "SNAPSHOT_TS": r.get("SNAPSHOT_TS",""),
+        }
+
+    # Detecta cambios
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for k, nuevo in estado_nuevo.items():
+        old = estado_prev.get(k, ("","",""))
+        old_ip, old_status, old_proto = old
+        new_ip = nuevo["IP_ADDRESS"]
+        new_status = nuevo["STATUS"]
+        new_proto = nuevo["PROTOCOL"]
+        if (old_ip, old_status, old_proto) != (new_ip, new_status, new_proto):
+            cambios.append({
+                "TS": ts,
+                "HOSTNAME": k[0],
+                "INTERFACE": k[1],
+                "OLD_IP": old_ip, "OLD_STATUS": old_status, "OLD_PROTOCOL": old_proto,
+                "NEW_IP": new_ip, "NEW_STATUS": new_status, "NEW_PROTOCOL": new_proto,
+                "SOURCE_CMD": nuevo["SOURCE_CMD"]
+            })
+
+    # Escribe cambios si hay
+    if cambios:
+        append_cambios(cambios)
+        print(f"[✓] Cambios detectados: {len(cambios)} (registrados en {CHANGES_FILE})")
     else:
-        raise RuntimeError(f"Formato no soportado: {ext}")
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    return df
+        print("[i] Sin cambios respecto al último estado.")
 
-def generar_hostname(device_str: str, serie: str) -> str:
-    """
-    Regla: primera letra de Device + Serie.
-    Si Device está vacío, usa 'D' como prefijo.
-    """
-    pref = (device_str.strip()[:1] or "D")
-    return f"{pref}{serie}"
+    # Actualiza estado actual
+    escribir_estado_actual(list(estado_nuevo.values()))
 
-# -------------------- Configuración --------------------
-def configurar_equipo(ser, hostname: str, user: str, secret: str, dominio: str) -> None:
-    txrx(ser, "enable", 0.4, 6)
-    txrx(ser, "configure terminal", 0.4, 6)
-    txrx(ser, f"hostname {hostname}", 0.5, 6)
-    txrx(ser, f"username {user} privilege 15 secret {secret}", 0.6, 6)
-    txrx(ser, f"ip domain-name {dominio}", 0.5, 6)
-    txrx(ser, "crypto key generate rsa modulus 1024", 1.2, 8)
-    txrx(ser, "line vty 0 4", 0.3, 4)
-    txrx(ser, "login local", 0.3, 4)
-    txrx(ser, "transport input ssh", 0.3, 4)
-    txrx(ser, "transport output ssh", 0.3, 4)
-    txrx(ser, "ip ssh version 2", 0.3, 4)
-    txrx(ser, "end", 0.3, 4)
-    txrx(ser, "write memory", 0.8, 6)
-
-# -------------------- Consola en vivo (tipo Moba/Putty) --------------------
-def _consola_windows(ser):
+# -------------------- Consola en vivo --------------------
+def consola_en_vivo(ser):
     """
-    Passthrough en Windows usando msvcrt.
-    Salida de serial -> stdout en tiempo real.
-    Teclado -> serial byte a byte.
+    Passthrough en tiempo real.
     Salir con Ctrl + ].
     """
-    import msvcrt
+    if os.name == "nt":
+        _consola_windows(ser)
+    else:
+        _consola_posix(ser)
 
+def _consola_windows(ser):
+    import msvcrt
     stop = False
 
     def lector():
@@ -158,7 +352,6 @@ def _consola_windows(ser):
                     try:
                         sys.stdout.write(data.decode(errors="ignore"))
                     except Exception:
-                        # imprime bytes crudos si no decodifica
                         sys.stdout.write(data.hex() + " ")
                     sys.stdout.flush()
             except Exception:
@@ -167,23 +360,17 @@ def _consola_windows(ser):
 
     hilo = threading.Thread(target=lector, daemon=True)
     hilo.start()
-
-    sys.stdout.write("\n[Conectado] Escribe tus comandos. Salir: Ctrl + ]\n\n")
-    sys.stdout.flush()
-
+    print("\n[Conectado] Escribe tus comandos. Salir: Ctrl + ]\n")
     try:
         while True:
             if msvcrt.kbhit():
-                ch = msvcrt.getwch()  # wide char
-                # Ctrl + ] => 0x1D
-                if ord(ch) == 0x1D:
+                ch = msvcrt.getwch()
+                if ord(ch) == 0x1D:  # Ctrl + ]
                     stop = True
                     break
-                # Enter = CRLF para Cisco
-                if ch == "\r" or ch == "\n":
+                if ch in ("\r", "\n"):
                     ser.write(b"\r\n")
                 else:
-                    # backspace manejo básico
                     if ch == "\b":
                         ser.write(b"\b")
                     else:
@@ -194,18 +381,12 @@ def _consola_windows(ser):
         hilo.join(timeout=1.0)
 
 def _consola_posix(ser):
-    """
-    Passthrough en Linux/macOS usando termios + select.
-    Salir con Ctrl + ].
-    """
     import termios, tty, select
-
     fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        sys.stdout.write("\n[Conectado] Escribe tus comandos. Salir: Ctrl + ]\n\n")
-        sys.stdout.flush()
+        print("\n[Conectado] Escribe tus comandos. Salir: Ctrl + ]\n")
         while True:
             rlist, _, _ = select.select([fd, ser], [], [], 0.05)
             if ser in rlist:
@@ -215,34 +396,45 @@ def _consola_posix(ser):
                     sys.stdout.flush()
             if fd in rlist:
                 ch = os.read(fd, 1)
-                if ch and ch[0] == 0x1D:  # Ctrl + ]
+                if ch and ch[0] == 0x1D:
                     break
                 if ch in (b"\r", b"\n"):
                     ser.write(b"\r\n")
                 else:
                     ser.write(ch)
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
-def consola_en_vivo():
-    """
-    Abre una sesión de consola en vivo en el puerto indicado.
-    Muestra el prompt y toda la salida como un terminal real.
-    """
-    limpiar_pantalla()
-    disponibles = puertos_disponibles()
-    print("Puertos detectados:", disponibles or "(ninguno)")
-    com = input("Puerto a usar (ej. COM5): ").strip()
-    if not com:
-        print("Sin puerto. Regresando…")
-        pausa()
+# -------------------- UI --------------------
+def elegir_puerto() -> Optional[str]:
+    ports = puertos_disponibles()
+    if not ports:
+        print("[-] No hay puertos serial detectados.")
+        return None
+    if len(ports) == 1:
+        print(f"[i] Usando puerto: {ports[0]}")
+        return ports[0]
+    print("Puertos detectados:", ports)
+    while True:
+        sel = input("Puerto a usar (ej. COM5 o /dev/ttyUSB0): ").strip()
+        if sel:
+            return sel
+
+def menu():
+    print("\n=== Cisco Serial Utility (compact) ===")
+    print("1) Consola en vivo")
+    print("2) Capturar snapshot de interfaces (CSV) y detectar cambios")
+    print("3) Monitorear cambios cada N segundos (Ctrl+C para salir)")
+    print("0) Salir")
+
+def main():
+    port = elegir_puerto()
+    if not port:
         return
-
     try:
-        ser = abrir_puerto(com, VELOCIDAD_DEF, TIMEOUT_S)
-        # pequeña siesta para estabilizar
-        time.sleep(1.2)
-        # “despertar” y quitar paginación para que los show no se corten
+        ser = abrir_puerto(port, VELOCIDAD_DEF, TIMEOUT_S)
+        time.sleep(1.0)
+        # Quita paginación
         try:
             ser.write(b"\r\n")
             time.sleep(0.1)
@@ -250,170 +442,38 @@ def consola_en_vivo():
         except Exception:
             pass
 
-        if os.name == "nt":
-            _consola_windows(ser)
-        else:
-            _consola_posix(ser)
-
+        while True:
+            menu()
+            op = input("Opción: ").strip()
+            if op == "1":
+                consola_en_vivo(ser)
+            elif op == "2":
+                host, rows = capturar_interfaces(ser)
+                snap = f"interfaces_snapshot_{now_tag()}.csv"
+                escribir_snapshot(snap, rows)
+                print(f"[✓] Snapshot guardado: {snap}")
+                detectar_y_guardar_cambios(rows)
+            elif op == "3":
+                try:
+                    n = input("Intervalo (segundos, default 30): ").strip() or "30"
+                    intervalo = max(5, int(n))
+                except Exception:
+                    intervalo = 30
+                print(f"[i] Monitoreando cada {intervalo}s. Ctrl+C para detener.")
+                try:
+                    while True:
+                        host, rows = capturar_interfaces(ser)
+                        detectar_y_guardar_cambios(rows)
+                        time.sleep(intervalo)
+                except KeyboardInterrupt:
+                    print("\n[+] Monitoreo detenido.")
+            elif op == "0":
+                break
+            else:
+                print("Opción inválida.")
         ser.close()
-        print("\n[Sesión cerrada]")
     except Exception as e:
-        print(f"Error abriendo la consola: {e}")
-    pausa()
-
-# -------------------- Menús --------------------
-def limpiar_pantalla():
-    os.system("cls" if os.name == "nt" else "clear")
-
-def pausa(msg="Presiona ENTER para continuar..."):
-    try:
-        input(msg)
-    except EOFError:
-        pass
-
-def menu():
-    limpiar_pantalla()
-    print("=== Utilidad de Consola Cisco ===")
-    print("1) Consola interactiva (EN VIVO, tipo PuTTY/Moba)  [Salir: Ctrl + ]]")
-    print("2) Configuración en lote (CSV/XLSX en esta carpeta)")
-    print("0) Salir")
-
-def configuracion_en_lote():
-    limpiar_pantalla()
-    path = buscar_archivo_inventario()
-    if not path:
-        print("No encontré Data.csv ni inventario.xlsx en esta carpeta.")
-        pausa()
-        return
-
-    print(f"Usando inventario: {path}\n")
-    try:
-        df = cargar_inventario(path)
-    except Exception as e:
-        print(f"No pude leer el inventario: {e}")
-        pausa()
-        return
-
-    # Columnas esperadas (case-insensitive):
-    # Port (opcional), Device, Serie, User, Password, Ip-domain, Baud (opcional)
-    cols = df.columns
-    for falta in ["device", "serie", "user", "password", "ip-domain"]:
-        if falta not in cols:
-            print(f"Falta columna requerida: {falta}")
-            pausa()
-            return
-
-    print(df)
-    pausa("\nRevisa el inventario. Conecta el primer equipo y presiona ENTER...")
-
-    resultados: List[Dict[str, str]] = []
-
-    for idx, row in df.iterrows():
-        device = str(row.get("device") or "").strip()
-        serie_esperada = str(row.get("serie") or "").strip()
-        usuario = str(row.get("user") or "").strip()
-        clave = str(row.get("password") or "").strip()
-        dominio = str(row.get("ip-domain") or "").strip()
-        com_csv = str(row.get("port") or "").strip()
-        try:
-            baud = int(row.get("baud")) if ("baud" in df.columns and str(row.get("baud")).strip()) else VELOCIDAD_DEF
-        except Exception:
-            baud = VELOCIDAD_DEF
-
-        limpiar_pantalla()
-        print(f"=== Dispositivo #{idx+1} ===")
-        print(f"CSV -> Device={device}  Serie={serie_esperada}  User={usuario}  Dom={dominio}  Baud={baud}")
-        detectados = puertos_disponibles()
-        print("Puertos detectados ahora:", detectados or "(ninguno)")
-        com = com_csv or input("Puerto a usar (ej. COM5): ").strip()
-        if not com:
-            resultados.append({"index": idx, "status": "SKIP", "detalle": "Sin puerto asignado"})
-            continue
-
-        input("Conecta el equipo al puerto indicado y presiona ENTER...")
-
-        try:
-            ser = abrir_puerto(com, baud, 1.0)
-            time.sleep(1.5)
-        except Exception as e:
-            print(f"[X] No se pudo abrir {com}: {e}")
-            resultados.append({"index": idx, "status": "ERROR_CONEXION", "detalle": str(e)})
-            pausa()
-            continue
-
-        # Lee serial real del equipo
-        real = leer_serie_equipo(ser)
-        print(f"Serie detectada: {real or '(vacía)'}")
-
-        if not real:
-            print("[!] No pude obtener serie. ¿Continuar solo con hostname por CSV? (y/N): ", end="")
-            if input("").strip().lower() != "y":
-                ser.close()
-                resultados.append({"index": idx, "status": "SIN_SERIE", "detalle": "No se detectó serie"})
-                pausa()
-                continue
-
-        # Arma hostname (regla: primera letra de Device + serie detectada o esperada)
-        serie_para_hostname = real or serie_esperada
-        hostname = generar_hostname(device, serie_para_hostname)
-        print(f"Hostname objetivo: {hostname}")
-
-        # Verificación opcional de mismatch
-        if serie_esperada and real and (serie_esperada.strip().upper() != real.strip().upper()):
-            print(f"[!] Ojo: serie CSV ({serie_esperada}) != serie detectada ({real}).")
-            print("¿Configurar de todos modos? (y/N): ", end="")
-            if input("").strip().lower() != "y":
-                ser.close()
-                resultados.append({"index": idx, "status": "MISMATCH_SERIE", "detalle": f"CSV={serie_esperada} != REAL={real}"})
-                pausa()
-                continue
-
-        # Configuración
-        try:
-            configurar_equipo(ser, hostname, usuario, clave, dominio)
-            status = "OK"
-            detalle = f"Aplicada config en {hostname}"
-        except Exception as e:
-            status = "ERROR_CONFIG"
-            detalle = str(e)
-
-        # Consola manual para probar (rápida con txrx; si quieres en vivo, usa opción 1 del menú)
-        print("\n¿Probar comandos manualmente (modo simple)? (Y/n): ", end="")
-        if input("").strip().lower() != "n":
-            print("\nEscribe 'quit' para regresar.\n")
-            while True:
-                cmd = input("cmd> ").strip()
-                if cmd.lower() == "quit":
-                    break
-                print(txrx(ser, cmd, 0.5, 10))
-
-        ser.close()
-        resultados.append({"index": idx, "status": status, "detalle": detalle, "serie_real": real or ""})
-        pausa("Listo ese equipo. ENTER para continuar con el siguiente...")
-
-    # Guardar reporte
-    rep = pd.DataFrame(resultados)
-    rep.to_csv("reporte_config.csv", index=False, encoding="utf-8-sig")
-    limpiar_pantalla()
-    print("[✓] Reporte guardado en reporte_config.csv")
-    print(rep)
-    pausa()
-
-# -------------------- Main Loop --------------------
-def main():
-    while True:
-        menu()
-        opcion = input("Elige una opción: ").strip()
-        if opcion == "1":
-            consola_en_vivo()
-        elif opcion == "2":
-            configuracion_en_lote()
-        elif opcion == "0":
-            print("Bye.")
-            break
-        else:
-            print("Opción inválida.")
-            pausa()
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
