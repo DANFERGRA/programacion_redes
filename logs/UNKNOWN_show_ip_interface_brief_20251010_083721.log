@@ -1,0 +1,6 @@
+show ip interface brief
+                    ^
+% Invalid input detected at '^' marker.
+
+Router(config-if)#
+Router(config-if)#

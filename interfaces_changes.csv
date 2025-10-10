@@ -1,0 +1,8 @@
+TS,HOSTNAME,INTERFACE,OLD_IP,OLD_STATUS,OLD_PROTOCOL,NEW_IP,NEW_STATUS,NEW_PROTOCOL,SOURCE_CMD
+2025-10-10 08:37:26,UNKNOWN,%,,,,Invalid,at '^',marker.,show ip interface brief (fallback)
+2025-10-10 08:48:25,Router,GigabitEthernet0/0,,,,192.168.10.1,down,down,show ip interface brief (fallback)
+2025-10-10 08:48:25,Router,GigabitEthernet0/1,,,,unassigned,administratively down,down,show ip interface brief (fallback)
+2025-10-10 08:48:25,Router,Serial0/0/0,,,,unassigned,administratively down,down,show ip interface brief (fallback)
+2025-10-10 08:48:25,Router,Serial0/0/1,,,,unassigned,administratively down,down,show ip interface brief (fallback)
+2025-10-10 08:48:25,Router,FastEthernet0/2/0,,,,unassigned,administratively down,down,show ip interface brief (fallback)
+2025-10-10 08:48:25,Router,FastEthernet0/2/1,,,,unassigned,administratively down,down,show ip interface brief (fallback)

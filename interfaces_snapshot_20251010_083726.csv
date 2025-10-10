@@ -1,0 +1,2 @@
+HOSTNAME,INTERFACE,IP_ADDRESS,STATUS,PROTOCOL,SOURCE_CMD,SNAPSHOT_TS
+UNKNOWN,%,Invalid,at '^',marker.,show ip interface brief (fallback),2025-10-10 08:37:17

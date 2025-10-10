@@ -1,0 +1,4 @@
+HOSTNAME,NAME,DESCR,PID,VID,SN,SOURCE_CMD,SNAPSHOT_TS
+Router,CISCO2901/K9,"CISCO2901/K9 chassis, Hw Serial#: FJC2037A1GQ, Hw Revision: 1.0",CISCO2901/K9,V06,FJC2037A1GQ,show inventory (fallback),2025-10-10 08:55:20
+Router,WAN Interface Card - HWIC Serial 2T on Slot 0 SubSlot 0,WAN Interface Card - HWIC Serial 2T,HWIC-2T,V05,FOC21121SZL,show inventory (fallback),2025-10-10 08:55:20
+Router,Two-Port Fast Ethernet High Speed WAN Interface Card on Slot 0 SubSlot 2,Two-Port Fast Ethernet High Speed WAN Interface Card,HWIC-2FE,V02,FOC20357DMA,show inventory (fallback),2025-10-10 08:55:20
