@@ -1,7 +1,0 @@
-HOSTNAME,INTERFACE,IP_ADDRESS,STATUS,PROTOCOL,SOURCE_CMD,SNAPSHOT_TS
-Router,GigabitEthernet0/0,192.168.10.1,down,down,show ip interface brief (fallback),2025-10-10 08:48:16
-Router,GigabitEthernet0/1,unassigned,administratively down,down,show ip interface brief (fallback),2025-10-10 08:48:16
-Router,Serial0/0/0,unassigned,administratively down,down,show ip interface brief (fallback),2025-10-10 08:48:16
-Router,Serial0/0/1,unassigned,administratively down,down,show ip interface brief (fallback),2025-10-10 08:48:16
-Router,FastEthernet0/2/0,unassigned,administratively down,down,show ip interface brief (fallback),2025-10-10 08:48:16
-Router,FastEthernet0/2/1,unassigned,administratively down,down,show ip interface brief (fallback),2025-10-10 08:48:16
