@@ -1,397 +1,488 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-find_ip_switch.py
+find_ip_switch.py — Rápido y robusto: IP→MAC→SWITCH/PUERTO (solo SSH al SW-CORE).
 
-Descripción:
-------------
-Script para localizar en qué switch y puerto está conectada una IP dentro de una red
-(Cisco IOS) en VLAN 1. Reporta:
-- Switch
-- Puerto físico
-- MAC
-- IP consultada
-
-Estrategia (sin TextFSM, usando regex robustos):
-1) Obtener la MAC asociada a la IP consultada utilizando varios comandos en los switches:
-   - DHCP Snooping bindings
-   - ARP directo/tabla ARP
-   - IP Device Tracking (si está habilitado)
-2) Con la MAC encontrada, buscar en las tablas de direcciones (show mac address-table)
-   de cada switch para determinar el puerto físico de acceso.
+Objetivo: Mantener la confiabilidad, pero reducir el tiempo total.
+Estrategia de velocidad (sin perder exactitud):
+  1) "Quick path" primero (ligero): no limpia nada; usa consultas específicas
+     (ARP puntual, CAM por MAC, CDP/LLDP por interfaz) y abandona apenas haya
+     un puerto final válido. Nada de pings múltiples ni pauses largos.
+  2) Sólo si el quick path no alcanza (multi‐puerto, uplink sin vecino, o desactualizado),
+     activa "heavy refresh" de forma selectiva (clear ARP/CAM + 1 ping rápido),
+     y reintenta en ese switch únicamente.
+  3) Anti-bucle conservado, pero con umbral más alto y reintentos internos
+     muy cortos para no cortar el flujo ni hacerlo repetir desde cero.
 
 Requisitos:
------------
-    pip install netmiko
-
-Notas:
-------
-- Si algunos "show" requieren privilegios, agrega "secret" a los diccionarios de SWITCHES
-  y se realizará "enable()".
-- De preferencia corre DHCP Snooping/Device Tracking en el SW-CORE.
-- Ajusta la lista SWITCHES a tus credenciales/IPs reales.
+  pip install netmiko textfsm ntc-templates
+  export NET_TEXTFSM=/ruta/a/ntc-templates/templates
 """
 
 from netmiko import ConnectHandler
-import re
+import re, time, socket
+from ipaddress import ip_network, ip_address
+from typing import Optional, Tuple, List, Set, Dict, Union
 
-# ===================== CONFIGURACIÓN =====================
-# Lista de switches a consultar. 'host_name' es solo para impresión en consola.
-SWITCHES = [
-    {"device_type": "cisco_ios", "ip": "192.168.1.11", "username": "cisco", "password": "cisco99", "host_name": "SW1"},
-    {"device_type": "cisco_ios", "ip": "192.168.1.1",  "username": "cisco", "password": "cisco99", "host_name": "SW-CORE"},
-    {"device_type": "cisco_ios", "ip": "192.168.1.12", "username": "cisco", "password": "cisco99", "host_name": "SW2"},
-]
-VLAN_OBJETIVO = "1"  # La práctica asume VLAN 1 para todos los dispositivos.
+# ===================== CONFIG BÁSICA =====================
+CORE = {
+    "device_type": "cisco_ios",
+    "host": "192.168.1.1",
+    "username": "cisco",
+    "password": "cisco99",
+    "secret":   "cisco99",
+    "port": 22,
+    # Activamos fast_cli para recortar RTTs; mantenemos delays manuales donde importa.
+    "fast_cli": True,
+    "global_delay_factor": 1,
+    "banner_timeout": 45,
+    "auth_timeout": 30,
+    "conn_timeout": 12,
+    "session_log": "netmiko_swcore.log",
+}
 
-# Si tu equipo requiere enable:
-# for s in SWITCHES: s["secret"] = "tu_enable_secret"
+MGMT_NET = ip_network("192.168.1.0/24")   # Vlan de gestión
+UPLINK_PORT_NUMBERS = {"47", "48"}        # Nunca reportar estos como puerto final
+MAX_HOPS = 10
 
-# ===================== UTILIDADES =====================
-# Patrones para detectar MAC en distintos formatos que arroja IOS:
-# - aaaa.bbbb.cccc
-# - 00:11:22:33:44:55
-# - 001122334455 (plana)
-MAC_PATTERNS = [
-    r"[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}",
-    r"[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}",
-    r"[0-9a-fA-F]{12}"
-]
+# ===================== TUNING DE VELOCIDAD/ROBUSTEZ =====================
+# Quick path: consultas mínimas, sin limpiar.
+QP_PING_REPEAT        = 1     # cuando haya que forzar, usa 1 eco
+QP_PING_TIMEOUT_MS    = 300
+QP_SLEEP_SHORT        = 0.20  # sleeps cortos entre pasos
+QP_BULK_REFRESH_CYC   = 0     # quick path NO limpia en primer intento
 
-def norm_mac(mac: str) -> str:
-    """
-    Normaliza una dirección MAC a forma plana en minúsculas (sin separadores).
-    Ejemplo:
-        'aaaa.bbbb.cccc' -> 'aaaabbbbcccc'
-        'AA:BB:CC:DD:EE:FF' -> 'aabbccddeeff'
-    """
-    return re.sub(r"[^0-9a-fA-F]", "", mac).lower()
+# Heavy refresh (sólo cuando haga falta):
+HR_PING_REPEAT        = 2
+HR_PING_TIMEOUT_MS    = 400
+HR_CYCLES             = 1     # 1 ciclo suele bastar
+HR_SLEEP              = 0.25
 
-def any_mac_in(text: str):
-    """
-    Busca cualquier MAC en el texto de salida de un comando usando patrones conocidos.
-    Devuelve la MAC encontrada (string) o None si no detecta ninguna.
-    """
-    for pat in MAC_PATTERNS:
-        m = re.search(pat, text)
-        if m:
-            return m.group(0)
+# Antibucle más permisivo (para no cortar temprano) y con autorrecuperación corta:
+LOOP_SAME_STATE_THRESHOLD = 3   # declarar lazo si vemos el MISMO estado 3 veces seguidas
+LOOP_AUTO_RECOVERY_TRIES  = 2   # cuántas limpiezas rápidas antes de rendirse
+
+# ===================== COMANDOS =====================
+CMD_NO_PAGE  = "terminal length 0"
+CMD_HOSTNAME = "show running-config | include ^hostname"
+CMD_MGMT_IP  = "show ip interface brief | inc Vlan1|BVI1|Loopback0"
+
+MAC_RE = r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})"
+IP_RE  = r"(\d{1,3}(?:\.\d{1,3}){3})"
+
+# ===================== HELPERS BASE =====================
+
+def tcp_check(host: str, port: int, timeout: float = 3.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+def send_t(conn, cmd: str) -> str:
+    """send_command_timing con paginación simple."""
+    out = conn.send_command_timing(cmd, strip_prompt=False, strip_command=False)
+    while "--More--" in out or "--More -" in out:
+        out += conn.send_command_timing(" ", strip_prompt=False, strip_command=False)
+    return out
+
+def manual_session_prep(conn):
+    conn.write_channel("\n"); time.sleep(0.05)
+    try:
+        conn.set_base_prompt()
+    except Exception:
+        pass
+    send_t(conn, CMD_NO_PAGE)
+
+def ensure_enable(conn):
+    try:
+        out = conn.send_command_timing("show privilege", strip_prompt=False, strip_command=False)
+        if "Level 15" in out or "level 15" in out:
+            manual_session_prep(conn)
+            return
+    except Exception:
+        pass
+    out = conn.send_command_timing("enable", strip_prompt=False, strip_command=False)
+    if "Password" in out or "password" in out:
+        send_t(conn, CORE["secret"])
+    manual_session_prep(conn)
+
+def run(conn, cmd: str) -> str:
+    return send_t(conn, cmd)
+
+def normalize_mac(mac: str) -> str:
+    mac = mac.strip().lower().replace("-", "").replace(":", "").replace(".", "")
+    return f"{mac[0:4]}.{mac[4:8]}.{mac[8:12]}" if re.fullmatch(r"[0-9a-f]{12}", mac) else mac.lower()
+
+def port_looks_uplink(ifname: str) -> bool:
+    m = re.search(r"/(\d+)$", ifname)
+    return bool(m and m.group(1) in UPLINK_PORT_NUMBERS)
+
+def is_definitely_trunk(conn, iface: str) -> bool:
+    try:
+        text = run(conn, f"show interfaces {iface} switchport")
+    except Exception:
+        return False
+    if re.search(r"Administrative Mode:\s*trunk", text, re.I): return True
+    if re.search(r"Operational Mode:\s*trunk", text, re.I):   return True
+    if re.search(r"(Administrative|Operational) Mode:\s*access", text, re.I): return False
+    return False
+
+def listify_ifaces(if_field: Union[str, List[str]]) -> List[str]:
+    if if_field is None: return []
+    if isinstance(if_field, list): return [i.strip() for i in if_field if i and isinstance(i, str)]
+    if isinstance(if_field, str):
+        return [p.strip() for p in if_field.split(",")] if "," in if_field else [if_field.strip()]
+    return []
+
+def get_hostname(conn) -> str:
+    text = run(conn, CMD_HOSTNAME)
+    m = re.search(r"^hostname\s+(\S+)", text, re.M)
+    return m.group(1) if m else "UNKNOWN"
+
+def get_mgmt_ip(conn) -> Optional[str]:
+    text = run(conn, CMD_MGMT_IP)
+    m = re.search(IP_RE + r"\s+\S+\s+YES.*?up\s+up", text)
+    if m: return m.group(1)
+    m = re.search(IP_RE, text)
+    return m.group(1) if m else None
+
+# ===================== REFRESCOS SELECTIVOS =====================
+
+def ping_host(conn, ip: str, repeat: int, timeout_ms: int):
+    run(conn, f"ping {ip} repeat {repeat} timeout {timeout_ms}")
+
+def clear_arp_mac(conn, ip: Optional[str], mac: Optional[str]):
+    if ip:  run(conn, f"clear ip arp {ip}")
+    if mac: run(conn, f"clear mac address-table dynamic address {normalize_mac(mac)}")
+
+def light_refresh(conn, ip: str, mac: Optional[str]):
+    """Refresco mínimo para acelerar convergencia, usado selectivamente."""
+    clear_arp_mac(conn, ip, mac)
+    ping_host(conn, ip, repeat=QP_PING_REPEAT, timeout_ms=QP_PING_TIMEOUT_MS)
+    time.sleep(QP_SLEEP_SHORT)
+
+def heavy_refresh(conn, ip: str, mac: Optional[str]):
+    """Refresco 'fuerte' pero compacto (1 ciclo)."""
+    for _ in range(HR_CYCLES):
+        clear_arp_mac(conn, ip, mac)
+        ping_host(conn, ip, repeat=HR_PING_REPEAT, timeout_ms=HR_PING_TIMEOUT_MS)
+        time.sleep(HR_SLEEP)
+
+# ===================== IP → MAC (rápido) =====================
+
+def find_mac_for_ip(conn, ip: str) -> Optional[str]:
+    # Orden: DHCP Snooping → IDT → ARP puntual. No limpiar a menos que no salga.
+    out = conn.send_command("show ip dhcp snooping binding", use_textfsm=True)
+    if isinstance(out, list):
+        for row in out:
+            if str(row.get("ipaddr","")) == ip and row.get("mac"):
+                return normalize_mac(row["mac"])
+    else:
+        text = run(conn, "show ip dhcp snooping binding")
+        for ln in text.splitlines():
+            if ip in ln:
+                m = re.search(MAC_RE, ln, re.I)
+                if m: return normalize_mac(m.group(1))
+
+    text = run(conn, "show ip device tracking all")
+    for ln in text.splitlines():
+        if ip in ln:
+            m = re.search(MAC_RE, ln, re.I)
+            if m: return normalize_mac(m.group(1))
+
+    text = run(conn, f"show ip arp {ip}")
+    m = re.search(MAC_RE, text, re.I)
+    if m: return normalize_mac(m.group(1))
+
+    # Un único refresco ligero si aún no se obtuvo MAC
+    light_refresh(conn, ip, None)
+    text = run(conn, f"show ip arp {ip}")
+    m = re.search(MAC_RE, text, re.I)
+    if m: return normalize_mac(m.group(1))
+
+    # Último recurso: ARP global (rápido)
+    txt = conn.send_command("show ip arp", use_textfsm=True)
+    if isinstance(txt, list):
+        for row in txt:
+            if str(row.get("address")) == ip and row.get("mac"):
+                return normalize_mac(row["mac"])
+    else:
+        text = run(conn, "show ip arp")
+        for ln in text.splitlines():
+            if ip in ln:
+                m = re.search(MAC_RE, ln, re.I)
+                if m: return normalize_mac(m.group(1))
     return None
 
-def get_conn(sw: dict):
-    """
-    Crea y devuelve una conexión Netmiko a un switch Cisco IOS.
-    - Aplica 'terminal length 0' para evitar paginación.
-    - Si existe 'secret', intenta elevar privilegios con 'enable()'.
-    """
-    params = {
-        "device_type": sw["device_type"],
-        "host": sw["ip"],
-        "username": sw["username"],
-        "password": sw["password"],
-        "fast_cli": True,  # acelera envíos de comandos (mejora rendimiento)
-    }
-    if "secret" in sw and sw["secret"]:
-        params["secret"] = sw["secret"]
-    conn = ConnectHandler(**params)
-    try:
-        conn.send_command_timing("terminal length 0", strip_command=False)
-    except Exception:
-        # No todos los dispositivos aceptan esta orden o el método timing puede fallar sin impacto crítico.
-        pass
-    if "secret" in sw and sw["secret"]:
+# ===================== CAM (MAC → puertos) =====================
+
+def cam_lookup_all_ports(conn, mac: str) -> List[str]:
+    mac = normalize_mac(mac)
+    ports: List[str] = []
+
+    # Primero: consulta específica por MAC (evita barrer toda la tabla)
+    text = run(conn, f"show mac address-table address {mac}")
+    for ln in text.splitlines():
+        m = re.search(r"(?:dynamic|DYNAMIC)\s+([A-Za-z]+\S+)\s*$", ln)
+        if m: ports.append(m.group(1).strip())
+
+    if not ports:
+        out = conn.send_command("show mac address-table", use_textfsm=True)
+        if isinstance(out, list):
+            for r in out:
+                if normalize_mac(str(r.get("destination_address",""))) == mac:
+                    ports += listify_ifaces(r.get("destination_port"))
+        else:
+            text = run(conn, f"show mac address-table | include {mac}")
+            for ln in text.splitlines():
+                if mac in ln.lower():
+                    m = re.search(r"([A-Za-z]+\S+)\s*$", ln)
+                    if m: ports.append(m.group(1).strip())
+
+    # Dedup conservando orden
+    res, seen = [], set()
+    for p in ports:
+        if p and p not in seen:
+            res.append(p); seen.add(p)
+    return res
+
+# ===================== Vecinos (CDP/LLDP + Inferencia) =====================
+
+def neighbor_ip_from_interface(conn, iface: str) -> Optional[str]:
+    # CDP/LLDP por interfaz específica (rápido)
+    for cmd in (f"show cdp neighbors {iface} detail",
+                f"show cdp neighbor detail interface {iface}",
+                f"show lldp neighbors {iface} detail"):
+        out = conn.send_command(cmd, use_textfsm=False)
+        # Busca una Management IP en el output
+        m = re.search(r"(?:IP (?:Address|address)|Management Address|IP address):\s*" + IP_RE, out, re.I)
+        if m:
+            return m.group(1)
+    return None
+
+def get_arp_entries(conn) -> List[Tuple[str, str]]:
+    res: List[Tuple[str,str]] = []
+    text = run(conn, "show ip arp")
+    for ln in text.splitlines():
+        m_ip  = re.search(IP_RE, ln)
+        m_mac = re.search(MAC_RE, ln, re.I)
+        if m_ip and m_mac:
+            res.append((m_ip.group(1), normalize_mac(m_mac.group(1))))
+    return res
+
+def mac_on_interface(conn, mac: str, iface: str) -> bool:
+    return iface in cam_lookup_all_ports(conn, mac)
+
+def candidate_neighbor_ips_by_inference(conn, uplink_iface: str, self_ip: Optional[str]) -> List[str]:
+    candidates: Set[str] = set()
+    for ip, mac in get_arp_entries(conn):
         try:
-            conn.enable()
+            if self_ip and ip == self_ip: continue
+            if ip_address(ip) not in MGMT_NET: continue
         except Exception:
-            # Si falla enable(), se continúa en modo usuario (algunos 'show' seguirán funcionando).
-            pass
+            continue
+        try:
+            if mac_on_interface(conn, mac, uplink_iface):
+                candidates.add(ip)
+        except Exception:
+            continue
+    def score(ip):
+        last = int(ip.split(".")[-1])
+        pref = 0 if last in (11,12,13) else 1
+        return (pref, last)
+    return sorted(list(candidates), key=score)
+
+# ===================== SSH interno SIN redispatch =====================
+
+def ssh_to_neighbor_from_device(conn, username: str, password: str, neighbor_ip: str, current_hostname: str) -> Optional[str]:
+    """Salto rápido; valida que cambió el hostname."""
+    conn.write_channel("\n"); time.sleep(0.05)
+    conn.clear_buffer()
+    conn.write_channel(f"ssh -l {username} {neighbor_ip}\n")
+    time.sleep(0.5)
+
+    out = conn.read_channel()
+    if "yes/no" in out.lower():
+        conn.write_channel("yes\n"); time.sleep(0.3)
+        out = conn.read_channel()
+    if "Password:" in out or "password:" in out:
+        conn.write_channel(password + "\n"); time.sleep(0.6)
+
+    manual_session_prep(conn)
+    ensure_enable(conn)
+    new_hostname = get_hostname(conn)
+    if new_hostname and new_hostname != current_hostname:
+        return new_hostname
+
+    # salto inválido: intenta regresar rápido
+    try:
+        conn.write_channel("\x03\n"); time.sleep(0.05)
+        conn.write_channel("\n");   time.sleep(0.05)
+        conn.clear_buffer()
+        manual_session_prep(conn)
+    except Exception:
+        pass
+    return None
+
+# ===================== Elección de puerto (rápida) =====================
+
+def choose_access_or_assume(conn, ports: List[str]) -> Optional[str]:
+    for p in ports:
+        if port_looks_uplink(p): continue
+        if not is_definitely_trunk(conn, p):
+            return p
+    if len(ports) == 1 and not port_looks_uplink(ports[0]):
+        return ports[0]
+    return None
+
+# ===================== Quick step en un switch =====================
+
+def quick_step_here(conn, ip: str, mac: str) -> Tuple[Optional[str], List[str]]:
+    """Devuelve (puerto_final_o_None, lista_puertos_CAM). No limpia salvo necesidad mínima."""
+    ports = cam_lookup_all_ports(conn, mac)
+    if not ports:
+        # 1 micro refresh súper ligero (no costoso)
+        light_refresh(conn, ip, mac)
+        ports = cam_lookup_all_ports(conn, mac)
+
+    if not ports:
+        return None, []
+
+    access = choose_access_or_assume(conn, ports)
+    return access, ports
+
+# ===================== Trazado con rapidez y autorrecuperación =====================
+
+def trace_mac_fast(conn, ip: str, mac: str) -> Tuple[str, str, str]:
+    visited_states: Dict[str, Tuple[Tuple[str, ...], int]] = {}
+    hops = 0
+
+    while True:
+        hops += 1
+        if hops > MAX_HOPS:
+            raise RuntimeError("Demasiados saltos (posible lazo).")
+
+        this_host = get_hostname(conn)
+        this_mgmt_ip = get_mgmt_ip(conn) or "0.0.0.0"
+
+        # QUICK PATH en el switch actual
+        access, ports = quick_step_here(conn, ip, mac)
+        if access:
+            return this_host, this_mgmt_ip, access
+        if not ports:
+            # Heavy refresh selectivo SOLO si no hay información
+            heavy_refresh(conn, ip, mac)
+            access, ports = quick_step_here(conn, ip, mac)
+            if access:
+                return this_host, this_mgmt_ip, access
+            if not ports:
+                raise RuntimeError(f"No encuentro la MAC {mac} en la CAM de {this_host} ({this_mgmt_ip}).")
+
+        # Detección de estado (anti-bucle)
+        fp = tuple(sorted(ports))
+        prev = visited_states.get(this_mgmt_ip)
+        if prev and prev[0] == fp:
+            visited_states[this_mgmt_ip] = (fp, prev[1] + 1)
+            if prev[1] + 1 >= LOOP_SAME_STATE_THRESHOLD:
+                # Intentos cortos de autorrecuperación rápida para no volver a empezar
+                for _ in range(LOOP_AUTO_RECOVERY_TRIES):
+                    heavy_refresh(conn, ip, mac)
+                    access, ports = quick_step_here(conn, ip, mac)
+                    if access:
+                        return this_host, this_mgmt_ip, access
+                # Si aun así no, seguimos saltando por uplinks (no abortar de inmediato)
+        else:
+            visited_states[this_mgmt_ip] = (fp, 1)
+
+        # Saltar por uplinks (CDP/LLDP → inferencia)
+        jumped = False
+        for upl in ports:
+            if port_looks_uplink(upl) or is_definitely_trunk(conn, upl):
+                nbr_ip = neighbor_ip_from_interface(conn, upl)
+                if nbr_ip:
+                    new_hn = ssh_to_neighbor_from_device(conn, CORE["username"], CORE["password"], nbr_ip, this_host)
+                    if new_hn:
+                        jumped = True
+                        break
+                else:
+                    # Inferencia: probar candidatos rápidos
+                    cand_ips = candidate_neighbor_ips_by_inference(conn, upl, self_ip=this_mgmt_ip)
+                    for ipcand in cand_ips:
+                        new_hn = ssh_to_neighbor_from_device(conn, CORE["username"], CORE["password"], ipcand, this_host)
+                        if new_hn:
+                            jumped = True
+                            break
+                    if jumped: break
+        if not jumped:
+            # Sin vecino confiable: si hay 1 solo puerto no uplink, acéptalo.
+            if len(ports) == 1 and not port_looks_uplink(ports[0]):
+                return this_host, this_mgmt_ip, ports[0]
+            # último empujón local y reintento rápido
+            heavy_refresh(conn, ip, mac)
+            access, ports2 = quick_step_here(conn, ip, mac)
+            if access:
+                return this_host, this_mgmt_ip, access
+            # Si continúa sin vecino ni puerto final:
+            raise RuntimeError(
+                f"La MAC {mac} aparece en {ports} de {this_host}, sin vecino por CDP/LLDP/Inferencia."
+            )
+
+# ===================== Conexión CORE y MAIN =====================
+
+def connect_core_fast(core_params: dict):
+    host = core_params.get("host", "")
+    port = int(core_params.get("port", 22))
+    if not tcp_check(host, port, timeout=2.0):
+        raise RuntimeError(f"No hay TCP en {host}:{port} (SSH).")
+    conn = ConnectHandler(**core_params)
+    manual_session_prep(conn)
+    ensure_enable(conn)
     return conn
 
-def parse_vlan_from_iface(ifname: str) -> str | None:
-    """
-    Extrae el número de VLAN si la interfaz es de tipo 'VlanX'.
-    Ejemplo:
-        'Vlan1' -> '1'
-        'GigabitEthernet0/1' -> None
-    """
-    m = re.search(r"[Vv]lan(\d+)", ifname)
-    return m.group(1) if m else None
+def main():
+    target_ip = input("🔎 ¿Qué IP quieres buscar?: ").strip()
+    if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", target_ip):
+        print("IP inválida."); return
 
-def extract_vlan(text: str) -> str | None:
-    """
-    Intenta extraer un número de VLAN de una cadena genérica que contenga 'VLAN'/'Vlan'.
-    Acepta formatos como:
-        'Vlan 1', 'VLAN: 1', 'vlan 1'
-    """
-    m = re.search(r"[Vv][Ll][Aa][Nn]\s*:?[\s#]*([0-9]+)", text)
-    return m.group(1) if m else None
+    print(f"[i] Conectando al SW-CORE {CORE['host']} ...")
+    conn = connect_core_fast(CORE)
 
-def discover_mac_for_ip(conn, ip: str):
-    """
-    Dada una IP, intenta resolver la MAC asociada consultando varios orígenes:
-      1) DHCP Snooping bindings:
-         - 'show ip dhcp snooping binding | include <ip>'
-         - 'show ip dhcp snooping binding'
-      2) ARP directo por IP:
-         - 'show ip arp <ip>'
-      3) ARP general:
-         - 'show ip arp' / 'show arp'
-      4) IP Device Tracking (si está habilitado):
-         - 'show ip device tracking all | include <ip>'
-         - 'show ip device tracking all'
+    try:
+        # Quick path para obtener MAC (sin limpiezas iniciales pesadas)
+        print(f"[i] Resolviendo MAC para la IP {target_ip} ...")
+        mac = find_mac_for_ip(conn, target_ip)
+        if not mac:
+            # un empujón breve y segundo intento
+            light_refresh(conn, target_ip, None)
+            mac = find_mac_for_ip(conn, target_ip)
+        if not mac:
+            raise RuntimeError("No pude resolver la MAC (DHCP/IDT/ARP).")
+        print(f"[✓] MAC detectada: {mac}")
 
-    Devuelve un dict con:
-      {'ip','mac','src'('dhcp'|'arp'|'device-tracking'),'vlan', 'iface'}
-    o None si no se encuentra.
-    """
-    # --- 1) DHCP Snooping ---
-    cmds = [
-        f"show ip dhcp snooping binding | include {ip}",
-        "show ip dhcp snooping binding"
-    ]
-    for cmd in cmds:
+        print("[i] Persiguiendo la MAC (ruta rápida, con refresco selectivo) ...")
+        host, mgmt_ip, access_if = trace_mac_fast(conn, target_ip, mac)
+
+        print("\n====== RESULTADO ======")
+        print(f"IP consultada:  {target_ip}")
+        print(f"MAC del host:   {mac}")
+        print(f"Switch:         {host}")
+        print(f"IP de gestión:  {mgmt_ip}")
+        print(f"Puerto:         {access_if}")
+        print("=======================\n")
+
+        if port_looks_uplink(access_if):
+            print("⚠️ OJO: salió 47/48 (uplink). Esto NO debería ser host.")
+        else:
+            print("✅ Puerto de acceso válido.")
+
+    except Exception as e:
+        print(f"\n[ERROR] {e}\n")
+    finally:
         try:
-            out = conn.send_command(cmd, use_textfsm=False)
-            if ip in out:
-                # Línea típica (campos pueden variar por plataforma):
-                # 00:11:22:33:44:55  192.168.1.50  ...  1  Gi0/15
-                line = next((l for l in out.splitlines() if ip in l), "")
-                mac = any_mac_in(line)
-                vlan = None
-                iface = None
-                # Heurística: número de VLAN seguido de interfaz
-                vlan_num = re.search(r"\s(\d+)\s+([A-Za-z]+\d+(?:/\d+)*\S*)", line)
-                if vlan_num:
-                    vlan = vlan_num.group(1)
-                    iface = vlan_num.group(2)
-                if not vlan:
-                    vlan = extract_vlan(line)
-                if not vlan and iface:
-                    vlan = parse_vlan_from_iface(iface)
-                if mac:
-                    return {"ip": ip, "mac": mac, "src": "dhcp", "vlan": vlan, "iface": iface}
-        except Exception:
-            # Continuar intentando otras fuentes
-            pass
-
-    # --- 2) ARP directo por IP ---
-    for cmd in (f"show ip arp {ip}",):
-        try:
-            out = conn.send_command(cmd, use_textfsm=False)
-            if ip in out:
-                # Típico IOS:
-                # "Internet  192.168.1.50  0  aaaa.bbbb.cccc  ARPA  Vlan1"
-                line = next((l for l in out.splitlines() if ip in l), "")
-                mac = any_mac_in(line)
-                iface = None
-                vlan = None
-                # Interfaz suele ir al final de la línea
-                m_if = re.search(r"\s([A-Za-z0-9/\.]+)\s*$", line)
-                if m_if:
-                    iface = m_if.group(1)
-                vlan = parse_vlan_from_iface(iface or "")
-                if not vlan:
-                    vlan = extract_vlan(line)
-                if mac:
-                    return {"ip": ip, "mac": mac, "src": "arp", "vlan": vlan, "iface": iface}
-        except Exception:
-            pass
-
-    # --- 3) ARP genérico (cuando el equipo no soporta consulta directa) ---
-    for cmd in ("show ip arp", "show arp"):
-        try:
-            out = conn.send_command(cmd, use_textfsm=False)
-            if ip in out:
-                line = next((l for l in out.splitlines() if ip in l), "")
-                mac = any_mac_in(line)
-                iface = None
-                vlan = None
-                m_if = re.search(r"\s([A-Za-z0-9/\.]+)\s*$", line)
-                if m_if:
-                    iface = m_if.group(1)
-                vlan = parse_vlan_from_iface(iface or "")
-                if not vlan:
-                    vlan = extract_vlan(line)
-                if mac:
-                    return {"ip": ip, "mac": mac, "src": "arp", "vlan": vlan, "iface": iface}
-        except Exception:
-            pass
-
-    # --- 4) Device Tracking (si está disponible) ---
-    for cmd in (f"show ip device tracking all | include {ip}",
-                "show ip device tracking all"):
-        try:
-            out = conn.send_command(cmd, use_textfsm=False)
-            if ip in out:
-                # Ejemplo de línea:
-                # "192.168.1.50  aaaa.bbbb.cccc  Gi0/15 ..."
-                line = next((l for l in out.splitlines() if ip in l), "")
-                mac = any_mac_in(line)
-                iface = None
-                vlan = None
-                m_if = re.search(r"\s([A-Za-z]+[0-9/\.]+)\s", line)
-                if m_if:
-                    iface = m_if.group(1)
-                # Intento de inferir VLAN desde el texto o la interfaz (si fuera VlanX)
-                vlan = extract_vlan(out) or parse_vlan_from_iface(iface or "")
-                if mac:
-                    return {"ip": ip, "mac": mac, "src": "device-tracking", "vlan": vlan, "iface": iface}
-        except Exception:
-            pass
-
-    # Si ninguna fuente trajo datos, devolvemos None:
-    return None
-
-def find_port_for_mac(conn, mac: str):
-    """
-    Dada una MAC (en cualquier formato), intenta localizar el puerto y VLAN
-    consultando la tabla de direcciones:
-        - show mac address-table address <mac>
-        - show mac address-table | include <mac>
-        - show mac address-table   (barrida completa como último recurso)
-
-    Devuelve:
-        {'port': <puerto>, 'vlan': <vlan>, 'type': <tipo>}
-    o None si no la encuentra en ese switch.
-    """
-    mac_clean = norm_mac(mac)
-    # Construye variantes de la misma MAC en formatos comunes de IOS:
-    mac_variants = {
-        "dot": f"{mac_clean[0:4]}.{mac_clean[4:8]}.{mac_clean[8:12]}",
-        "colon": ":".join([mac_clean[i:i+2] for i in range(0,12,2)]),
-        "plain": mac_clean
-    }
-
-    # Secuencia de comandos: específicos -> filtros -> listado general
-    cmds = [
-        f"show mac address-table address {mac_variants['dot']}",
-        f"show mac address-table address {mac_variants['colon']}",
-        f"show mac address-table | include {mac_variants['dot']}",
-        f"show mac address-table | include {mac_variants['colon']}",
-        f"show mac address-table | include {mac_variants['plain']}",
-        "show mac address-table"
-    ]
-
-    for cmd in cmds:
-        try:
-            out = conn.send_command(cmd, use_textfsm=False)
-            if not out.strip():
-                continue
-
-            # Líneas típicas:
-            # "  1    aaaa.bbbb.cccc   DYNAMIC  Gi0/15"
-            for line in out.splitlines():
-                # Verifica si contiene alguna forma de la MAC
-                if any(v in line for v in mac_variants.values()):
-                    # VLAN: primer número aislado en la línea suele ser la VLAN
-                    m_vlan = re.search(r"\s(\d+)\s", line)
-                    vlan = m_vlan.group(1) if m_vlan else None
-                    # TYPE: DYNAMIC/STATIC/SELF/CPU...
-                    m_type = re.search(r"\s(DYNAMIC|STATIC|STATIC_SECURE|SELF|CPU)\s", line, re.IGNORECASE)
-                    typ = m_type.group(1) if m_type else "UNKNOWN"
-                    # PORT: último token tipo interfaz
-                    m_port = re.search(r"([A-Za-z]+\d+(?:/\d+)*\S*)\s*$", line)
-                    port = m_port.group(1) if m_port else None
-
-                    if port:
-                        return {"port": port, "vlan": vlan, "type": typ}
-        except Exception:
-            # Si falla un comando (no soportado u otro error), intentamos el siguiente
-            continue
-
-    return None
-
-def localizar_ip(ip_buscada: str):
-    """
-    Flujo principal para localizar una IP:
-    1) Recorre los switches y trata de resolver IP -> MAC (DHCP/ARP/Device Tracking).
-       Suele existir en el SW-CORE, pero se intentan todos por robustez.
-    2) Con la MAC obtenida, recorre todos los switches para encontrar el puerto de acceso
-       consultando la tabla MAC. Aplica una heurística simple para preferir:
-         - Coincidencia en VLAN objetivo.
-         - Puertos que no luzcan como trunks (ej. Port-Channel, TenGig, etc.)
-    3) Imprime el resultado final o un aviso si no fue posible localizar el puerto.
-    """
-    print(f"\n🔎 Buscando la IP {ip_buscada} en la red...\n")
-
-    # 1) Intentar hallar la MAC a partir de la IP
-    mac_info = None
-    src_sw = None
-    for sw in SWITCHES:
-        try:
-            conn = get_conn(sw)
-            info = discover_mac_for_ip(conn, ip_buscada)
             conn.disconnect()
-            if info:
-                mac_info = info
-                src_sw = sw
-                print(f"[{sw['host_name']}] IP encontrada -> MAC {info['mac']} (via {info['src']}) IF:{info.get('iface','?')} VLAN:{info.get('vlan','?')}")
-                break
-            else:
-                print(f"[{sw['host_name']}] Sin binding/ARP/DT para {ip_buscada}")
-        except Exception as e:
-            print(f"[!] Error conectando a {sw['host_name']} ({sw['ip']}): {e}")
+        except Exception:
+            pass
 
-    if not mac_info:
-        # Si no hay MAC, no es posible continuar con la búsqueda del puerto.
-        print("❌ No se encontró la IP en DHCP Snooping, ARP ni Device Tracking en ningún switch.")
-        return
-
-    # 2) Con la MAC, buscar en qué switch/puerto aparece en la tabla MAC
-    mac = mac_info["mac"]
-    best_result = None
-    best_switch = None
-
-    for sw in SWITCHES:
-        try:
-            conn = get_conn(sw)
-            loc = find_port_for_mac(conn, mac)
-            conn.disconnect()
-            if loc:
-                # Heurística: preferir
-                # - VLAN objetivo (puntaje extra)
-                # - Puerto que no parezca trunk/port-channel (penalización si lo es)
-                port = loc["port"]
-                is_trunkish = bool(re.search(r"Po\d+|Port-Channel|^Gi0/1$|^Gi1/0/1$|^Te|^Fo", port, re.IGNORECASE))
-                vlan_score = 2 if (loc["vlan"] == VLAN_OBJETIVO) else 1
-                trunk_penalty = 0 if not is_trunkish else -1
-                score = vlan_score + trunk_penalty
-
-                if (best_result is None) or (score > best_result.get("score", 0)):
-                    best_result = {"port": port, "vlan": loc["vlan"], "type": loc["type"], "score": score}
-                    best_switch = sw
-        except Exception as e:
-            print(f"[!] Error conectando a {sw['host_name']} ({sw['ip']}): {e}")
-
-    if best_result and best_switch:
-        # Éxito: se encontró puerto y switch
-        print("\n📘 Resultado final:")
-        print(f"  ├── Switch:   {best_switch['host_name']}")
-        print(f"  ├── IP:       {ip_buscada}")
-        print(f"  ├── MAC:      {mac}")
-        print(f"  ├── Puerto:   {best_result['port']}")
-        print(f"  └── VLAN:     {best_result['vlan'] or mac_info.get('vlan','?')}\n")
-        return
-
-    # 3) MAC encontrada pero sin entrada en tablas MAC (posibles causas: aging, MAC aprendida por trunk,
-    #    endpoint inactivo, puerto err-disable, topología diferente a lo esperado, etc.)
-    print("\n⚠️ Se obtuvo la MAC, pero no aparece en la tabla de direcciones de los switches.")
-    print(f"   IP: {ip_buscada} | MAC: {mac} | Origen: {src_sw['host_name']} | VLAN: {mac_info.get('vlan','?')} | IF: {mac_info.get('iface','?')}\n")
-
-# ===================== MAIN =====================
 if __name__ == "__main__":
-    import sys
-    import re as _re
-
-    # Bucle interactivo de consulta
-    while True:
-        ip = input("\nIngresa la IP que deseas buscar (o 'exit' para salir): ").strip()
-        if ip.lower() == "exit":
-            break
-        # Validación básica de formato IPv4
-        if not _re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
-            print("Formato de IP no válido.")
-            continue
-        try:
-            localizar_ip(ip)
-        except KeyboardInterrupt:
-            print("\nInterrumpido por usuario.")
-            sys.exit(0)
+    main()

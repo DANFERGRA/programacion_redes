@@ -1,0 +1,79 @@
+
+SW_CORE#
+SW_CORE#terminal width 511
+SW_CORE#terminal length 0
+SW_CORE#
+SW_CORE#
+SW_CORE#
+SW_CORE#terminal length 0
+SW_CORE#show privilege
+Current privilege level is 15
+SW_CORE#enable
+SW_CORE#
+SW_CORE#
+SW_CORE#terminal length 0
+SW_CORE#
+SW_CORE#show ip dhcp snooping binding
+MacAddress          IpAddress        Lease(sec)  Type           VLAN  Interface
+------------------  ---------------  ----------  -------------  ----  --------------------
+Total number of bindings: 0
+
+SW_CORE#show ip dhcp snooping binding
+MacAddress          IpAddress        Lease(sec)  Type           VLAN  Interface
+------------------  ---------------  ----------  -------------  ----  --------------------
+Total number of bindings: 0
+
+SW_CORE#show ip device tracking all
+IP Device Tracking = Disabled
+-----------------------------------------------------------------------
+  IP Address     MAC Address   Vlan  Interface                STATE    
+-----------------------------------------------------------------------
+
+SW_CORE#show ip arp 192.168.1.26
+Protocol  Address          Age (min)  Hardware Addr   Type   Interface
+Internet  192.168.1.26            0   bcfc.e7c5.2e92  ARPA   Vlan10
+SW_CORE#show running-config | include ^hostname
+hostname SW_CORE
+SW_CORE#show ip interface brief | inc Vlan1|BVI1|Loopback0
+Vlan1                  unassigned      YES NVRAM  administratively down down    
+Vlan10                 192.168.1.1     YES NVRAM  up                    up      
+SW_CORE#show mac address-table address bcfc.e7c5.2e92
+          Mac Address Table
+-------------------------------------------
+
+Vlan    Mac Address       Type        Ports
+----    -----------       --------    -----
+  10    bcfc.e7c5.2e92    DYNAMIC     Fa1/0/18
+Total Mac Addresses for this criterion: 1
+SW_CORE#show interfaces Fa1/0/18 switchport
+Name: Fa1/0/18
+Switchport: Enabled
+Administrative Mode: static access
+Operational Mode: static access
+Administrative Trunking Encapsulation: negotiate
+Operational Trunking Encapsulation: native
+Negotiation of Trunking: Off
+Access Mode VLAN: 10 (VLAN0010)
+Trunking Native Mode VLAN: 1 (default)
+Administrative Native VLAN tagging: enabled
+Voice VLAN: none
+Administrative private-vlan host-association: none 
+Administrative private-vlan mapping: none 
+Administrative private-vlan trunk native VLAN: none
+Administrative private-vlan trunk Native VLAN tagging: enabled
+Administrative private-vlan trunk encapsulation: dot1q
+Administrative private-vlan trunk normal VLANs: none
+Administrative private-vlan trunk associations: none
+Administrative private-vlan trunk mappings: none
+Operational private-vlan: none
+Trunking VLANs Enabled: ALL
+Pruning VLANs Enabled: 2-1001
+Capture Mode Disabled
+Capture VLANs Allowed: ALL
+
+Protected: false
+Unknown unicast blocked: disabled
+Unknown multicast blocked: disabled
+Appliance trust: none
+SW_CORE#
+SW_CORE#exit
