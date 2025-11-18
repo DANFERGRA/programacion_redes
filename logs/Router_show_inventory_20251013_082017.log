@@ -1,0 +1,16 @@
+show inventory
+NAME: "CISCO2901/K9", DESCR: "CISCO2901/K9 chassis, Hw Serial#: FJC2037A1GQ, Hw Revision: 1.0"
+PID: CISCO2901/K9      , VID: V06 , SN: FJC2037A1GQ
+
+NAME: "WAN Interface Card - HWIC Serial 2T on Slot 0 SubSlot 0", DESCR: "WAN Interface Card - HWIC Serial 2T"
+PID: HWIC-2T           , VID: V05 , SN: FOC21121SZL
+
+NAME: "Two-Port Fast Ethernet High Speed WAN Interface Card on Slot 0 SubSlot 2", DESCR: "Two-Port Fast Ethernet High Speed WAN Interface Card"
+PID: HWIC-2FE          , VID: V02 , SN: FOC20357DMA
+
+NAME: "C1941/C2901 AC Power Supply", DESCR: "C1941/C2901 AC Power Supply"
+PID: PWR-1941-2901-AC  , VID:    , SN:            
+
+
+Router#
+Router#

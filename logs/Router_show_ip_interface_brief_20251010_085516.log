@@ -1,0 +1,11 @@
+show ip interface brief
+Interface                  IP-Address      OK? Method Status                Protocol
+Embedded-Service-Engine0/0 unassigned      YES unset  administratively down down    
+GigabitEthernet0/0         192.168.10.1    YES manual down                  down    
+GigabitEthernet0/1         unassigned      YES unset  administratively down down    
+Serial0/0/0                unassigned      YES unset  administratively down down    
+Serial0/0/1                unassigned      YES unset  administratively down down    
+FastEthernet0/2/0          unassigned      YES unset  administratively down down    
+FastEthernet0/2/1          unassigned      YES unset  administratively down down    
+Router#
+Router#

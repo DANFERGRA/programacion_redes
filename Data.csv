@@ -1,0 +1,6 @@
+﻿device,serie,user,password,ip-domain,baud
+Router Oficina,FTX1234ABC,cisco,cisco,lab.local,9600
+Router Core,JAE9876543,cisco,cisco,corp.local,9600
+Router Acceso,FCW1122334,cisco,cisco,acceso.local,9600
+Router Backup,FTX5566778,cisco,cisco,backup.local,9600
+Router Borde,JAE4455667,cisco,cisco,borde.local,9600
